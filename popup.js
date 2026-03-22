@@ -7,7 +7,6 @@ const DEFAULTS = {
   keepMessages: 20,
   showStatusBar: true,
   showDebugPanel: false,
-  ultraLean: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -16,7 +15,6 @@ const keepEl       = $("keepMessages");
 const keepValueEl  = $("keepValue");
 const showStatusEl = $("showStatus");
 const showDebugEl  = $("showDebug");
-const ultraLeanEl  = $("ultraLean");
 const refreshBtn   = $("refreshBtn");
 const statusReadout = $("statusReadout");
 
@@ -27,7 +25,6 @@ chrome.storage.local.get(DEFAULTS, (data) => {
   keepValueEl.textContent = data.keepMessages;
   showStatusEl.checked = data.showStatusBar;
   showDebugEl.checked  = data.showDebugPanel;
-  ultraLeanEl.checked  = data.ultraLean;
 });
 
 // ─── Save on change (content script picks up via onChanged) ───
@@ -37,14 +34,12 @@ function save() {
     keepMessages:  parseInt(keepEl.value, 10),
     showStatusBar: showStatusEl.checked,
     showDebugPanel: showDebugEl.checked,
-    ultraLean:     ultraLeanEl.checked,
   });
 }
 
 enabledEl.addEventListener("change", save);
 showStatusEl.addEventListener("change", save);
 showDebugEl.addEventListener("change", save);
-ultraLeanEl.addEventListener("change", save);
 keepEl.addEventListener("input", () => { keepValueEl.textContent = keepEl.value; });
 keepEl.addEventListener("change", save);
 

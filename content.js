@@ -1,9 +1,11 @@
-// content.js — LightSession for Claude v2.1
-// Self-discovering DOM trimmer with debug validation panel.
+// content.js — LightSession for Claude v2.2
+// Self-discovering DOM trimmer with scroll-to-restore.
 //
 // Settings sync: chrome.storage.onChanged (no message relay).
 // Trim method: display:none !important via <style> tag + inline.
-// Debug: overlay panel with live DOM metrics + highlight tool.
+// Scroll-to-restore: scrolling near the top reveals hidden messages;
+//   scrolling back to the bottom re-enables trimming.
+// Ultra Lean: available in the debug panel only (experimental).
 
 (() => {
   "use strict";
@@ -13,7 +15,6 @@
     keepMessages: 20,
     showStatusBar: true,
     showDebugPanel: false,
-    ultraLean: false,
   };
 
   let S = { ...DEFAULTS };          // current settings
@@ -25,12 +26,14 @@
   let statusEl = null;
   let debugEl = null;
   let ultraLeanEl = null;
+  let ultraLeanActive = false;
+  let isPeeking = false;            // true while user has scrolled up to read old messages
+  let scrollContainer = null;
+  let scrollListener = null;
 
   // ═══════════════════════════════════════════════════════════════
   //  SELECTOR DISCOVERY
   // ═══════════════════════════════════════════════════════════════
-  // We try multiple strategies to find message elements.
-  // Each returns { selector, elements } or null.
 
   function tryTestIdSelector() {
     const els = document.querySelectorAll(
@@ -47,7 +50,6 @@
   }
 
   function tryScrollContainerChildren() {
-    // Find the main scrollable area and treat its direct children as messages.
     const candidates = document.querySelectorAll("main div, body > div > div div");
     const scrollables = [];
 
@@ -60,25 +62,19 @@
       }
     }
 
-    // Sort: prefer the one with the most children
     scrollables.sort((a, b) => b.children.length - a.children.length);
 
     for (const container of scrollables.slice(0, 3)) {
       const msgs = [...container.children].filter((el) => {
         if (el.tagName !== "DIV") return false;
-        // Skip tiny elements (spacers, dividers)
         if (el.offsetHeight < 40) return false;
-        // Skip elements that contain the text input
         if (el.querySelector('[contenteditable="true"], textarea')) return false;
-        // Must have some text
         if ((el.textContent || "").trim().length < 5) return false;
-        // Skip our own injected elements
         if (el.id && el.id.startsWith("ls-")) return false;
         return true;
       });
 
       if (msgs.length >= 2) {
-        // Tag them so we can re-select
         msgs.forEach((el, i) => el.setAttribute("data-ls-idx", String(i)));
         return { selector: "[data-ls-idx]", elements: msgs };
       }
@@ -87,12 +83,9 @@
   }
 
   function tryGroupedDivHeuristic() {
-    // Find the largest set of sibling divs under a common parent
-    // that look like a conversation (substantial text, similar structure).
     const main = document.querySelector("main") || document.body;
     const byParent = new Map();
 
-    // Walk only direct-child divs of each container
     main.querySelectorAll("div").forEach((parent) => {
       const kids = [...parent.children].filter(
         (c) => c.tagName === "DIV" && c.offsetHeight > 40 &&
@@ -167,6 +160,7 @@
 
   function trimConversation() {
     if (!S.enabled) { restoreAll(); return; }
+    if (isPeeking) return;  // user is reading old messages — don't re-hide
 
     const messages = findMessages();
     const total = messages.length;
@@ -179,7 +173,6 @@
     }
 
     if (total <= keep) {
-      // Nothing to trim — ensure everything visible
       const tag = ensureStyleTag();
       tag.textContent = "";
       messages.forEach((el) => {
@@ -197,17 +190,13 @@
 
     messages.forEach((el, i) => {
       if (i < cutoff) {
-        // HIDE — use both CSS rule AND inline style for maximum specificity
         el.style.setProperty("display", "none", "important");
         el.setAttribute("data-ls-hidden", "true");
-
-        // If using data-ls-idx, also add CSS rule
         const idx = el.getAttribute("data-ls-idx");
         if (idx !== null) {
           rules.push(`[data-ls-idx="${idx}"] { display: none !important; }`);
         }
       } else {
-        // SHOW
         el.style.removeProperty("display");
         el.removeAttribute("data-ls-hidden");
       }
@@ -228,13 +217,73 @@
       el.removeAttribute("data-ls-idx");
     });
     cachedSelector = null;
+    isPeeking = false;
     stats = { total: 0, visible: 0, hidden: 0, strategy: "none", selector: "none" };
+    renderOverlays();
+  }
+
+  // Reveal all hidden messages without resetting the selector cache.
+  // Used when the user scrolls up — trimming resumes when they scroll back down.
+  function revealAll() {
+    isPeeking = true;
+    if (styleTag) styleTag.textContent = "";
+    document.querySelectorAll("[data-ls-hidden]").forEach((el) => {
+      el.style.removeProperty("display");
+      el.removeAttribute("data-ls-hidden");
+    });
+    stats = { ...stats, visible: stats.total, hidden: 0 };
     renderOverlays();
   }
 
   function scheduleTrim() {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(trimConversation, 200);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  SCROLL-TO-RESTORE
+  // ═══════════════════════════════════════════════════════════════
+
+  function findScrollContainer() {
+    const candidates = document.querySelectorAll("main div, body > div > div div");
+    for (const div of candidates) {
+      const cs = getComputedStyle(div);
+      if ((cs.overflowY === "auto" || cs.overflowY === "scroll") &&
+          div.scrollHeight > div.clientHeight + 200) {
+        return div;
+      }
+    }
+    return null;
+  }
+
+  function attachScrollListener() {
+    if (scrollContainer && scrollListener) {
+      scrollContainer.removeEventListener("scroll", scrollListener);
+      scrollListener = null;
+      scrollContainer = null;
+    }
+
+    const container = findScrollContainer();
+    if (!container) {
+      setTimeout(attachScrollListener, 2000);
+      return;
+    }
+
+    scrollContainer = container;
+    scrollListener = () => {
+      if (!S.enabled) return;
+      const nearTop = container.scrollTop < 150;
+      const nearBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight < 200;
+
+      if (nearTop && stats.hidden > 0 && !isPeeking) {
+        revealAll();
+      } else if (isPeeking && nearBottom) {
+        isPeeking = false;
+        scheduleTrim();
+      }
+    };
+    container.addEventListener("scroll", scrollListener, { passive: true });
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -307,14 +356,13 @@
     const v = actuallyVisible[0];
     const e = (s) => (s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-    // Validation checks
     const checks = [];
 
     if (hiddenEls.length > 0) {
       const ok = actuallyHidden.length === hiddenEls.length;
       checks.push(`<div style="color:${ok ? "#34d399" : "#f87171"}">
         ${ok ? "\u2713" : "\u2717"} display:none working: ${actuallyHidden.length}/${hiddenEls.length} hidden
-        ${!ok ? '<br><span style="color:#fbbf24;font-size:10px">\u2192 React is overriding! Try lowering keep count or Ultra Lean</span>' : ""}
+        ${!ok ? '<br><span style="color:#fbbf24;font-size:10px">\u2192 React is overriding! Try lowering keep count</span>' : ""}
       </div>`);
     }
 
@@ -328,6 +376,12 @@
     if (allMsgs.length < S.keepMessages) {
       checks.push(`<div style="color:#fbbf24">
         \u26A0 ${allMsgs.length} msgs found, keep=${S.keepMessages} \u2014 nothing to trim yet
+      </div>`);
+    }
+
+    if (isPeeking) {
+      checks.push(`<div style="color:#fbbf24">
+        \u26A0 Peek mode \u2014 scroll to bottom to re-enable trimming
       </div>`);
     }
 
@@ -345,6 +399,9 @@
       </div>`;
     };
 
+    const ulColor = ultraLeanActive ? "#34d399" : "#71717a";
+    const ulLabel = ultraLeanActive ? "Ultra Lean: ON" : "Ultra Lean: OFF";
+
     debugEl.innerHTML = `
       <div style="color:#c084fc;font-weight:600;font-size:13px;margin-bottom:10px;
                   border-bottom:1px solid rgba(192,132,252,0.2);padding-bottom:6px">
@@ -359,8 +416,8 @@
 
       <div style="margin-bottom:10px">
         <div style="color:#a1a1aa;font-size:9px;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px">Counts</div>
-        <div>Found: <b style="color:#34d399">${allMsgs.length}</b> · 
-             Hidden: <b style="color:#f87171">${hiddenEls.length}</b> · 
+        <div>Found: <b style="color:#34d399">${allMsgs.length}</b> ·
+             Hidden: <b style="color:#f87171">${hiddenEls.length}</b> ·
              Visible: <b style="color:#34d399">${actuallyVisible.length}</b></div>
         <div style="color:#71717a">DOM nodes: ${totalNodes.toLocaleString()} · Keep: ${S.keepMessages}</div>
       </div>
@@ -373,13 +430,19 @@
       ${sampleBlock("Sample Hidden", h, "#f87171")}
       ${sampleBlock("Sample Visible", v, "#34d399")}
 
-      <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:8px;display:flex;gap:6px">
+      <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:8px;display:flex;gap:6px;flex-wrap:wrap">
         <button id="ls-btn-highlight" style="flex:1;background:rgba(192,132,252,0.12);color:#c084fc;
           border:1px solid rgba(192,132,252,0.25);border-radius:6px;padding:4px 8px;
           font-family:inherit;font-size:10px;cursor:pointer">Highlight</button>
         <button id="ls-btn-rediscover" style="flex:1;background:rgba(52,211,153,0.12);color:#34d399;
           border:1px solid rgba(52,211,153,0.25);border-radius:6px;padding:4px 8px;
           font-family:inherit;font-size:10px;cursor:pointer">Re-discover</button>
+        <button id="ls-btn-ultralean" style="flex:1;background:rgba(251,191,36,0.08);color:${ulColor};
+          border:1px solid rgba(251,191,36,0.2);border-radius:6px;padding:4px 8px;
+          font-family:inherit;font-size:10px;cursor:pointer">${ulLabel}</button>
+      </div>
+      <div style="margin-top:6px;font-size:9px;color:#52525b">
+        Ultra Lean: kills animations + CSS containment. Experimental — may cause visual glitches.
       </div>
     `;
 
@@ -402,6 +465,12 @@
       cachedSelector = null;
       trimConversation();
     };
+
+    debugEl.querySelector("#ls-btn-ultralean").onclick = () => {
+      ultraLeanActive = !ultraLeanActive;
+      applyUltraLean(ultraLeanActive);
+      renderDebugPanel();
+    };
   }
 
   function renderOverlays() {
@@ -410,7 +479,7 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  ULTRA LEAN
+  //  ULTRA LEAN (debug panel only)
   // ═══════════════════════════════════════════════════════════════
 
   function applyUltraLean(on) {
@@ -437,7 +506,7 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  SETTINGS SYNC (the fix — no more message relay)
+  //  SETTINGS SYNC
   // ═══════════════════════════════════════════════════════════════
 
   function loadSettings() {
@@ -449,20 +518,15 @@
     });
   }
 
-  // This fires instantly when the popup writes to storage.
-  // No background.js middleman needed.
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
     for (const [key, { newValue }] of Object.entries(changes)) {
       if (key in S) S[key] = newValue;
     }
-    applyUltraLean(S.ultraLean);
     scheduleTrim();
-    // Re-render overlays immediately for toggle responsiveness
     renderOverlays();
   });
 
-  // GET_STATUS still uses message passing (popup → background → here)
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "GET_STATUS") {
       const msgs = findMessages();
@@ -510,10 +574,14 @@
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       cachedSelector = null;
+      isPeeking = false;
       document.querySelectorAll("[data-ls-idx]").forEach((el) =>
         el.removeAttribute("data-ls-idx")
       );
-      setTimeout(scheduleTrim, 600);
+      setTimeout(() => {
+        scheduleTrim();
+        attachScrollListener();
+      }, 600);
     }
   }, 1000);
 
@@ -523,11 +591,11 @@
 
   async function init() {
     await loadSettings();
-    applyUltraLean(S.ultraLean);
     startObserver();
+    attachScrollListener();
     setTimeout(trimConversation, 1000);
     setTimeout(trimConversation, 3000);
-    console.log("%c\u26A1 LightSession for Claude v2.1", "color:#c084fc;font-weight:bold;font-size:12px");
+    console.log("%c\u26A1 LightSession for Claude v2.2", "color:#c084fc;font-weight:bold;font-size:12px");
   }
 
   init();
