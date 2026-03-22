@@ -4,7 +4,7 @@
 
 const DEFAULTS = {
   enabled: true,
-  keepMessages: 20,
+  keepMessages: 10,
   showStatusBar: true,
   showDebugPanel: false,
 };

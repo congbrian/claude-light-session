@@ -1,23 +1,23 @@
-// content.js — LightSession for Claude v2.2
-// Self-discovering DOM trimmer with scroll-to-restore.
+// content.js — LightSession for Claude v2.3
+// Self-discovering DOM trimmer with chunked scroll pagination.
 //
 // Settings sync: chrome.storage.onChanged (no message relay).
 // Trim method: display:none !important via <style> tag + inline.
-// Scroll-to-restore: scrolling near the top reveals hidden messages;
-//   scrolling back to the bottom re-enables trimming.
-// Ultra Lean: available in the debug panel only (experimental).
+// Scroll-to-load: scrolling near the top reveals the previous keepMessages
+//   chunk. Works by operating directly on [data-ls-hidden] elements —
+//   no re-discovery needed, no index recomputation.
 
 (() => {
   "use strict";
 
   const DEFAULTS = {
     enabled: true,
-    keepMessages: 20,
+    keepMessages: 10,
     showStatusBar: true,
     showDebugPanel: false,
   };
 
-  let S = { ...DEFAULTS };          // current settings
+  let S = { ...DEFAULTS };
   let stats = { total: 0, visible: 0, hidden: 0, strategy: "none", selector: "none" };
   let observer = null;
   let debounceTimer = null;
@@ -27,9 +27,10 @@
   let debugEl = null;
   let ultraLeanEl = null;
   let ultraLeanActive = false;
-  let isPeeking = false;            // true while user has scrolled up to read old messages
+  let isPeeking = false;   // true while user has loaded extra chunks above
   let scrollContainer = null;
   let scrollListener = null;
+  let chunkCooldown = false;
 
   // ═══════════════════════════════════════════════════════════════
   //  SELECTOR DISCOVERY
@@ -39,14 +40,18 @@
     const els = document.querySelectorAll(
       '[data-testid*="turn"], [data-testid*="message-row"], [data-testid*="chat-message"]'
     );
-    return els.length >= 2 ? { selector: '[data-testid*="turn"], [data-testid*="message-row"], [data-testid*="chat-message"]', elements: [...els] } : null;
+    return els.length >= 2
+      ? { selector: '[data-testid*="turn"], [data-testid*="message-row"], [data-testid*="chat-message"]', elements: [...els] }
+      : null;
   }
 
   function tryRoleSelector() {
     const els = document.querySelectorAll(
       '[data-role="human"], [data-role="assistant"], [data-role="user"]'
     );
-    return els.length >= 2 ? { selector: '[data-role="human"], [data-role="assistant"], [data-role="user"]', elements: [...els] } : null;
+    return els.length >= 2
+      ? { selector: '[data-role="human"], [data-role="assistant"], [data-role="user"]', elements: [...els] }
+      : null;
   }
 
   function tryScrollContainerChildren() {
@@ -93,18 +98,13 @@
                !c.querySelector('[contenteditable="true"], textarea') &&
                !(c.id && c.id.startsWith("ls-"))
       );
-      if (kids.length >= 4) {
-        byParent.set(parent, kids);
-      }
+      if (kids.length >= 4) byParent.set(parent, kids);
     });
 
     let best = null;
     let bestLen = 0;
     for (const [, kids] of byParent) {
-      if (kids.length > bestLen) {
-        bestLen = kids.length;
-        best = kids;
-      }
+      if (kids.length > bestLen) { bestLen = kids.length; best = kids; }
     }
 
     if (best && best.length >= 2) {
@@ -115,10 +115,10 @@
   }
 
   const STRATEGIES = [
-    { name: "data-testid", fn: tryTestIdSelector },
-    { name: "data-role", fn: tryRoleSelector },
+    { name: "data-testid",      fn: tryTestIdSelector },
+    { name: "data-role",        fn: tryRoleSelector },
     { name: "scroll-container", fn: tryScrollContainerChildren },
-    { name: "grouped-div", fn: tryGroupedDivHeuristic },
+    { name: "grouped-div",      fn: tryGroupedDivHeuristic },
   ];
 
   function discoverMessages() {
@@ -158,9 +158,21 @@
     return styleTag;
   }
 
+  // Rebuild the CSS rules to match whatever is currently marked data-ls-hidden.
+  // Called after partial reveals so the stylesheet stays in sync.
+  function rebuildStyleTag() {
+    const tag = ensureStyleTag();
+    const rules = [];
+    document.querySelectorAll("[data-ls-hidden]").forEach((el) => {
+      const idx = el.getAttribute("data-ls-idx");
+      if (idx !== null) rules.push(`[data-ls-idx="${idx}"] { display: none !important; }`);
+    });
+    tag.textContent = rules.join("\n");
+  }
+
   function trimConversation() {
     if (!S.enabled) { restoreAll(); return; }
-    if (isPeeking) return;  // user is reading old messages — don't re-hide
+    if (isPeeking) return; // user is reading older messages — don't re-hide
 
     const messages = findMessages();
     const total = messages.length;
@@ -193,9 +205,7 @@
         el.style.setProperty("display", "none", "important");
         el.setAttribute("data-ls-hidden", "true");
         const idx = el.getAttribute("data-ls-idx");
-        if (idx !== null) {
-          rules.push(`[data-ls-idx="${idx}"] { display: none !important; }`);
-        }
+        if (idx !== null) rules.push(`[data-ls-idx="${idx}"] { display: none !important; }`);
       } else {
         el.style.removeProperty("display");
         el.removeAttribute("data-ls-hidden");
@@ -222,17 +232,46 @@
     renderOverlays();
   }
 
-  // Reveal all hidden messages without resetting the selector cache.
-  // Used when the user scrolls up — trimming resumes when they scroll back down.
-  function revealAll() {
+  // Reveal the previous keepMessages-sized chunk.
+  // Operates directly on [data-ls-hidden] elements — the exact elements we
+  // hid — so no re-discovery or index recomputation is needed.
+  function revealChunk() {
+    const allHidden = [...document.querySelectorAll("[data-ls-hidden]")];
+    if (allHidden.length === 0) return;
+
     isPeeking = true;
-    if (styleTag) styleTag.textContent = "";
-    document.querySelectorAll("[data-ls-hidden]").forEach((el) => {
+
+    // The hidden elements are in DOM order: oldest first.
+    // The LAST n of them are closest to the visible window — reveal those.
+    const n = S.keepMessages;
+    const toReveal = allHidden.slice(-n);
+    const boundaryEl = toReveal[0]; // will become the new first visible message
+
+    toReveal.forEach((el) => {
       el.style.removeProperty("display");
       el.removeAttribute("data-ls-hidden");
     });
-    stats = { ...stats, visible: stats.total, hidden: 0 };
+
+    // Keep the stylesheet in sync with whatever is still hidden.
+    rebuildStyleTag();
+
+    stats = {
+      ...stats,
+      visible: stats.visible + toReveal.length,
+      hidden: stats.hidden - toReveal.length,
+    };
     renderOverlays();
+
+    // Scroll so the boundary element sits at the top of the container.
+    // requestAnimationFrame lets layout settle (including any scroll-anchoring
+    // adjustments) before we read positions.
+    if (boundaryEl && scrollContainer) {
+      requestAnimationFrame(() => {
+        const containerRect = scrollContainer.getBoundingClientRect();
+        const elRect = boundaryEl.getBoundingClientRect();
+        scrollContainer.scrollTop += elRect.top - containerRect.top;
+      });
+    }
   }
 
   function scheduleTrim() {
@@ -241,7 +280,7 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  SCROLL-TO-RESTORE
+  //  SCROLL-TO-LOAD
   // ═══════════════════════════════════════════════════════════════
 
   function findScrollContainer() {
@@ -272,12 +311,13 @@
     scrollContainer = container;
     scrollListener = () => {
       if (!S.enabled) return;
-      const nearTop = container.scrollTop < 150;
-      const nearBottom =
-        container.scrollHeight - container.scrollTop - container.clientHeight < 200;
+      const nearTop    = container.scrollTop < 150;
+      const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 200;
 
-      if (nearTop && stats.hidden > 0 && !isPeeking) {
-        revealAll();
+      if (nearTop && stats.hidden > 0 && !chunkCooldown) {
+        chunkCooldown = true;
+        setTimeout(() => { chunkCooldown = false; }, 800);
+        revealChunk();
       } else if (isPeeking && nearBottom) {
         isPeeking = false;
         scheduleTrim();
@@ -310,7 +350,7 @@
     }
     statusEl.style.display = "";
     statusEl.textContent = stats.hidden > 0
-      ? `\u26A1 ${stats.visible}/${stats.total} msgs (${stats.hidden} trimmed)`
+      ? `\u26A1 ${stats.visible}/${stats.total} msgs \u2014 scroll up for more`
       : `\u26A1 ${stats.total} msgs`;
   }
 
@@ -380,8 +420,8 @@
     }
 
     if (isPeeking) {
-      checks.push(`<div style="color:#fbbf24">
-        \u26A0 Peek mode \u2014 scroll to bottom to re-enable trimming
+      checks.push(`<div style="color:#a78bfa">
+        \u2191 Peek mode \u2014 scroll to bottom to re-enable trimming
       </div>`);
     }
 
@@ -523,6 +563,7 @@
     for (const [key, { newValue }] of Object.entries(changes)) {
       if (key in S) S[key] = newValue;
     }
+    isPeeking = false;
     scheduleTrim();
     renderOverlays();
   });
@@ -595,7 +636,7 @@
     attachScrollListener();
     setTimeout(trimConversation, 1000);
     setTimeout(trimConversation, 3000);
-    console.log("%c\u26A1 LightSession for Claude v2.2", "color:#c084fc;font-weight:bold;font-size:12px");
+    console.log("%c\u26A1 LightSession for Claude v2.3", "color:#c084fc;font-weight:bold;font-size:12px");
   }
 
   init();
