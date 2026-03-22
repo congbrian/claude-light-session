@@ -129,6 +129,11 @@
           cachedSelector = result.selector;
           stats.strategy = name;
           stats.selector = result.selector;
+          // Attach the scroll listener now, while all messages are still
+          // visible and scrollHeight is at its maximum. This is the only
+          // reliable window — by the time the retry fires post-trim,
+          // scrollHeight may have shrunk below the detection threshold.
+          attachScrollListener();
           return result.elements;
         }
       } catch (e) {
