@@ -46,6 +46,8 @@ LightSession hides older messages from the DOM (via `display: none`) so the brow
 3. Adjust the slider to set how many messages to keep
 4. Toggle Ultra Lean mode if the tab is really struggling
 
+> **Note**: Currently works on standard Claude chats only. Projects and other claude.ai views are not yet supported.
+
 ## How It Works
 
 ```
